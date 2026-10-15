@@ -1,0 +1,6 @@
+verifyDepsBeforeRun: false
+# Corepack and CI select packageManager while the dependency lockfile stays single-document.
+pmOnFail: ignore
+
+allowBuilds:
+  esbuild: true

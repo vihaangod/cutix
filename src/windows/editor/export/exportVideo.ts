@@ -1,0 +1,845 @@
+/**
+ * Export: composite the timeline to MP4 / WebM / GIF.
+ *
+ * One compositor (the same Pixi one the preview uses, so every route is
+ * WYSIWYG) and a small, fixed set of encode routes:
+ *
+ * - **MP4** — the native engine first (`exportNative.ts`: Rust decodes,
+ *   composites on the GPU, hardware-encodes and muxes audio in one pass). If it
+ *   fails, `planMp4Routes()` in `exportRouting.ts`: Annex-B WebCodecs → ffmpeg
+ *   `-c copy` when an encoder has been *verified* on this machine
+ *   (`annexBProbe.ts`), otherwise RGBA readback → ffmpeg hardware encode.
+ * - **WebM** — mediabunny muxes in-webview (VP9/AV1/VP8 + in-container audio).
+ * - **GIF** — gifenc.
+ *
+ * Every wait is watched (`exportStall.ts`): an encoder that goes quiet fails its
+ * route and the next one is tried. Nothing in here can hang the progress bar.
+ *
+ * Export media is loaded as `blob:` URLs so the canvas is never tainted by
+ * `media://`.
+ */
+
+import { translateNow } from "@/lib/i18n";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
+import {
+  CanvasSource,
+  canEncodeVideo,
+  Output,
+  StreamTarget,
+  WebMOutputFormat,
+  type VideoCodec,
+  type VideoEncodingAdditionalOptions,
+} from "mediabunny";
+
+import { totalKeptDuration } from "@/engine";
+import { isWindows, mediaUrl } from "@/lib/platform";
+import { commands } from "../../../ipc/bindings";
+import { describeError } from "../../recorder/store";
+import { logClientError } from "@/lib/errorLogging";
+import { useEditorStore } from "../store";
+import {
+  createExportCompositor,
+  createExportCompositorFromMedia,
+  planFrameTimes,
+} from "./exportCompositor";
+import {
+  createExportFrameIterator,
+  warnSeekPath,
+} from "./exportFrameLoop";
+import {
+  ensureSeekableForSeekPath,
+  openExportSequentialMedia,
+} from "./exportMediaOpen";
+import { exportLog } from "./exportLog";
+import { shouldYieldNow, yieldToMain } from "./exportYield";
+import { AdaptiveEncodeQueue } from "./encodeBackpressure";
+import { ExportSink } from "./exportSink";
+import { openExportAudioTrack } from "./exportAudioTrack";
+import { renderGifToSink } from "./exportGif";
+import { exportMp4Native, nativeExportEnabled } from "./exportNative";
+import { renderMp4ViaFfmpegH264 } from "./exportH264Ffmpeg";
+import { renderMp4ViaFfmpegRawvideo } from "./exportRawvideoFfmpeg";
+import { probeAnnexBConfig } from "./annexBProbe";
+import { planMp4Routes, type Mp4Route } from "./exportRouting";
+import {
+  ENCODE_STALL_MS,
+  FLUSH_STALL_MS,
+  isExportStallError,
+  withDeadline,
+} from "./exportStall";
+import { throttledProgress } from "./exportProgress";
+import {
+  beginExportAbort,
+  endExportAbort,
+  isExportCancelled,
+  throwIfAborted,
+} from "./exportCancel";
+import {
+  DEFAULT_EXPORT_SETTINGS,
+  estimateExportBytes,
+  resolveExportParams,
+  type ExportAudioEnhance,
+  type ExportSettings,
+  type ResolvedExportParams,
+} from "./exportSettings";
+import { isPassthroughEligible } from "./passthrough";
+import { captureExportSnapshot, type ExportSnapshot } from "./exportSnapshot";
+import { resolveStageSize } from "../lib/composition";
+import { type FaceCamTrack } from "../lib/faceCamSync";
+import {
+  GpuContextLostError,
+  isGpuContextLostError,
+  markPreferDomCanvasForExport,
+  reclaimGpuAfterLoss,
+  reloadEditorForDeadGpu,
+} from "../render/gpuLifecycle";
+
+export { cancelActiveExport } from "./exportCancel";
+
+type ExportDestination = { handle: string; displayName: string };
+
+
+function throwIfGpuLost(isLost: () => boolean): void {
+  if (isLost()) throw new GpuContextLostError();
+}
+
+export async function exportProject(
+  settings: ExportSettings = DEFAULT_EXPORT_SETTINGS,
+): Promise<void> {
+  const store = useEditorStore.getState();
+  const { project, screenUrl, sourceVideoSize } = store;
+  if (!project || !screenUrl || !sourceVideoSize) return;
+  const snapshot = captureExportSnapshot(store);
+
+  // Carried as one value so no export path can read the face-cam without the
+  // offset that puts it on the screen timeline.
+  const faceCam: FaceCamTrack = {
+    url: snapshot.cameraUrl,
+    offsetMs: snapshot.cameraOffsetMs,
+  };
+
+  // Same stage resolution the preview composites at — the ratio picker is the
+  // single source of output size.
+  const stage = resolveStageSize(snapshot.aspectRatioPresetId, snapshot.sourceVideoSize);
+  const resolved = resolveExportParams(settings, stage.width, stage.height);
+  const fileExt = resolved.ext;
+  const base =
+    (project.title ?? "recording").replace(/[^\w.-]+/g, "-") || "recording";
+  const suggestedName = `${base}.${fileExt}`;
+
+  store.setExporting(true);
+  store.setExportError(null);
+  const abortSession = beginExportAbort();
+  const signal = abortSession.signal;
+
+  const keptDuration =
+    snapshot.segments.length > 0
+      ? totalKeptDuration(snapshot.segments)
+      : snapshot.duration;
+
+  // Rust owns the selected path for the entire export. The renderer receives an
+  // opaque capability that every encode and post-processing route must present.
+  // Disk-space gating happens inside select_export_destination via `needed`.
+  let destination: ExportDestination | null = null;
+  try {
+    store.setExportStatus(translateNow("export.status.choosePath"));
+    destination = await commands.selectExportDestination({
+      suggestedName,
+      fileType: fileExt,
+      needed: estimateExportBytes(resolved, keptDuration),
+    });
+  } catch (e) {
+    store.setExportError(describeError(e));
+    logClientError("export:pickDestination", e);
+  }
+  if (!destination || signal.aborted) {
+    if (destination) {
+      await commands
+        .discardExportDestination(destination.handle)
+        .catch(() => undefined);
+    }
+    endExportAbort(abortSession.id);
+    const s = useEditorStore.getState();
+    s.setExporting(false);
+    s.setExportStatus(null);
+    return;
+  }
+  const selectedDestination = destination;
+
+  // "Original" fast path: stream-copy, no render. Eligibility is re-checked
+  // against live state — if the project gained edits after the dialog opened,
+  // it just renders normally instead of silently dropping them.
+  if (
+    settings.passthrough &&
+    resolved.ext === "mp4" && // MP4 format+container; never GIF or WebM
+    isPassthroughEligible({
+      segments: snapshot.segments,
+      duration: snapshot.duration,
+      zoomFragments: snapshot.zoomFragments,
+      blurRegions: snapshot.blurRegions,
+      captions: snapshot.captions,
+      cameraUrl: snapshot.cameraUrl,
+      screenContentCrop: snapshot.screenContentCrop,
+    })
+  ) {
+    store.setExportStatus(translateNow("export.status.saving"));
+    try {
+      await commands.exportPassthrough({
+        projectId: snapshot.project.id,
+        destination: selectedDestination.handle,
+        preset: settings.audioEnhance,
+        hasSystemAudio: snapshot.project.capture.capturedSystemAudio,
+      });
+      throwIfAborted(signal);
+      await notifyDone(selectedDestination);
+      destination = null;
+    } catch (e) {
+      if (!isExportCancelled(e)) {
+        store.setExportError(describeError(e));
+        logClientError("export:passthrough", e);
+      }
+    } finally {
+      if (destination) {
+        await commands
+          .discardExportDestination(destination.handle)
+          .catch(() => undefined);
+      }
+      endExportAbort(abortSession.id);
+      const s = useEditorStore.getState();
+      s.setExporting(false);
+      s.setExportProgress(0);
+      s.setExportStatus(null);
+    }
+    return;
+  }
+
+  store.setExportStatus(
+    translateNow(
+      resolved.format === "gif"
+        ? "export.status.renderingGif"
+        : "export.rendering",
+    ),
+  );
+  let sink: ExportSink | null = null;
+  // Prepared audio track (trimmed/enhanced) built while seekable-ensure runs —
+  // when mediabunny can open it, packets mux into the container during encode
+  // and the post-export FFmpeg attach is skipped.
+  let audioPrep: Promise<PreparedExportAudio | null> | null = null;
+  let audioHandle: string | null = null;
+  let prepared: PreparedExportAudio | null = null;
+  let gpuWasLost = false;
+  try {
+    if (resolved.format === "gif") {
+      sink = await ExportSink.open(selectedDestination.handle);
+      await renderGifToSink(sink, screenUrl, faceCam, resolved, signal, snapshot);
+      store.setExportStatus(translateNow("export.status.saving"));
+      await sink.finish();
+      sink = null;
+      await notifyDone(selectedDestination);
+      destination = null;
+      return;
+    }
+
+    // MP4: the native engine renders, encodes and muxes audio in one pass.
+    // Any failure but a cancel falls through to the WebView routes below —
+    // Rust has released the destination for them.
+    if (resolved.container === "mp4" && nativeExportEnabled()) {
+      try {
+        await exportMp4Native(
+          selectedDestination.handle,
+          resolved,
+          settings.audioEnhance,
+          signal,
+          snapshot,
+        );
+        throwIfAborted(signal);
+        store.setExportStatus(translateNow("export.status.saving"));
+        await notifyDone(selectedDestination);
+        destination = null;
+        return;
+      } catch (e) {
+        if (isExportCancelled(e)) throw e;
+        logClientError("export:native", e);
+        exportLog(
+          `[export] native route failed (${describeError(e)}); using the WebView routes`,
+        );
+        store.setExportProgress(0);
+      }
+    }
+
+    // Kick audio prepare before ensureSeekable so FFmpeg overlaps that work.
+    audioPrep = prepareExportAudioTrack(
+      resolved.container === "webm" ? "webm" : "m4a",
+      settings.audioEnhance,
+      snapshot,
+    ).catch((e) => {
+      console.warn("export audio prepare failed; will fall back to post-mux", e);
+      return null;
+    });
+
+    // Sequential decode opens on Range reads — no upfront migration. If it
+    // fails, each render path retries after ensureSeekableRecording (see
+    // openExportSequentialMedia) or migrates before the seek fallback.
+
+    const attachAudioAndFinish = async () => {
+      store.setExportStatus(translateNow("export.status.saving"));
+      if (prepared) {
+        store.setExportStatus(translateNow("export.status.addingAudio"));
+        await commands
+          .attachExportAudio({
+            destination: selectedDestination.handle,
+            audio: prepared.handle,
+          })
+          .catch(async (e) => {
+            console.warn("export audio attach failed; trying full mux", e);
+            await muxRecordedAudio(
+              selectedDestination.handle,
+              settings.audioEnhance,
+              snapshot,
+            );
+          });
+      } else {
+        await muxRecordedAudio(
+          selectedDestination.handle,
+          settings.audioEnhance,
+          snapshot,
+        ).catch((e) =>
+          console.warn("export audio mux failed; keeping silent video", e),
+        );
+      }
+      await notifyDone(selectedDestination);
+      destination = null;
+    };
+
+    if (resolved.container === "mp4") {
+      // Audio preparation runs concurrently with video rendering. It is not
+      // needed until the video-only MP4 has been finalized.
+      await exportMp4(
+        selectedDestination.handle,
+        screenUrl,
+        faceCam,
+        resolved,
+        signal,
+        snapshot,
+      );
+      prepared = audioPrep ? await audioPrep : null;
+      throwIfAborted(signal);
+      audioHandle = prepared?.handle ?? null;
+      await attachAudioAndFinish();
+      return;
+    }
+
+    // WebM: mediabunny muxes in-webview, audio included in-container when the
+    // prepared track opens.
+    prepared = audioPrep ? await audioPrep : null;
+    throwIfAborted(signal);
+    audioHandle = prepared?.handle ?? null;
+    sink = await ExportSink.open(selectedDestination.handle);
+    const audioMuxed = await renderWebmToSink(
+      sink,
+      screenUrl,
+      faceCam,
+      resolved,
+      prepared?.mediaUrl ?? null,
+      signal,
+      snapshot,
+    );
+    throwIfAborted(signal);
+    store.setExportStatus(translateNow("export.status.saving"));
+    await sink.finish();
+    sink = null;
+
+    if (audioMuxed) {
+      await notifyDone(selectedDestination);
+      destination = null;
+    } else {
+      await attachAudioAndFinish();
+    }
+  } catch (e) {
+    await sink?.abort(e);
+    // Cancel is intentional — don't surface it as an export failure toast.
+    if (!isExportCancelled(e)) {
+      if (isGpuContextLostError(e)) {
+        gpuWasLost = true;
+        markPreferDomCanvasForExport("export GpuContextLostError");
+        useEditorStore
+          .getState()
+          .setExportError(translateNow("export.error.gpuContextLost"));
+        logClientError("export:gpu", e);
+      } else {
+        useEditorStore.getState().setExportError(describeError(e));
+        logClientError("export", e);
+      }
+    }
+  } finally {
+    endExportAbort(abortSession.id);
+    // Prepare may still be in flight if we failed before awaiting it — wait and
+    // delete so capptivo-export-audio-* never accumulates in the project dir.
+    if (!audioHandle && audioPrep) {
+      const leftover = await audioPrep.catch(() => null);
+      audioHandle = leftover?.handle ?? null;
+    }
+    if (audioHandle) {
+      void commands
+        .removeTempFile({ handle: audioHandle })
+        .catch(() => undefined);
+    }
+    if (destination) {
+      await commands
+        .discardExportDestination(destination.handle)
+        .catch(() => undefined);
+    }
+    // Reclaim BEFORE clearing exporting — otherwise preview remounts into a
+    // dead WebView2 GPU and the next export fails with a fake "no WebGL".
+    let reloadForDeadGpu = false;
+    if (gpuWasLost) {
+      const { ok } = await reclaimGpuAfterLoss();
+      if (!ok) {
+        await useEditorStore.getState().flushEditorPersist();
+        reloadForDeadGpu = true;
+      }
+    }
+    const s = useEditorStore.getState();
+    s.setExporting(false);
+    s.setExportProgress(0);
+    s.setExportStatus(null);
+    if (reloadForDeadGpu) {
+      reloadEditorForDeadGpu();
+    }
+  }
+}
+
+/**
+ * Render an MP4 by walking the planned routes until one produces a file.
+ *
+ * Only route *failures* advance the list. Cancellation and GPU loss are
+ * terminal: retrying a cancelled export would ignore the user, and retrying on a
+ * dead GPU context just fails again more slowly.
+ */
+async function exportMp4(
+  destination: string,
+  screenUrl: string,
+  faceCam: FaceCamTrack,
+  resolved: ResolvedExportParams,
+  signal: AbortSignal,
+  snapshot: ExportSnapshot,
+): Promise<void> {
+  const forceRgba = import.meta.env.VITE_CAPPTIVO_RAWVIDEO_EXPORT === "1";
+
+  // Verified, not merely declared: this is a real encode of real frames with a
+  // deadline, and it is the difference between failing in a few hundred
+  // milliseconds and freezing an export at 1% forever. Windows is probed too —
+  // prefer-software Annex-B avoids the RGBA pipe when healthy (Recordly-style).
+  const annexBTuning = forceRgba
+    ? null
+    : await probeAnnexBConfig(
+        resolved.width,
+        resolved.height,
+        resolved.bitrate,
+        resolved.fps,
+        { windows: isWindows },
+      );
+  throwIfAborted(signal);
+
+  const routes = planMp4Routes({
+    annexBVerified: annexBTuning != null,
+    forceRgba,
+  });
+  exportLog(`[export] mp4 route plan: ${routes.join(" → ")}`);
+
+  // Stated as an invariant rather than asserted away: if the planner ever emits
+  // this route without a verified encoder, that surfaces as an ordinary route
+  // failure and the export continues on RGBA instead of throwing at the user.
+  const runRoute = (route: Mp4Route): Promise<void> => {
+    if (route === "annexb-ffmpeg") {
+      if (!annexBTuning) {
+        throw new Error("annexb-ffmpeg planned without a verified encoder");
+      }
+      return renderMp4ViaFfmpegH264(
+        destination,
+        screenUrl,
+        faceCam,
+        resolved,
+        signal,
+        annexBTuning,
+        snapshot,
+      );
+    }
+    return renderMp4ViaFfmpegRawvideo(
+      destination,
+      screenUrl,
+      faceCam,
+      resolved,
+      signal,
+      snapshot,
+    );
+  };
+
+  const failures: string[] = [];
+  for (const route of routes) {
+    try {
+      exportLog(`[export] path=${route}`);
+      await runRoute(route);
+      throwIfAborted(signal);
+      return;
+    } catch (e) {
+      if (isExportCancelled(e) || isGpuContextLostError(e)) throw e;
+      const reason = describeError(e);
+      failures.push(`${route}: ${reason}`);
+      logClientError(`export:${route}`, e);
+      console.warn(
+        `[export] ${route} failed (${reason})` +
+          (isExportStallError(e) ? " [stalled]" : ""),
+      );
+    }
+  }
+
+  throw new Error(`MP4 export failed — ${failures.join("; ")}`);
+}
+
+/**
+ * Mux the recorded audio into the just-saved (video-only) export, trimmed to the
+ * same kept segments the video uses. Rust runs FFmpeg (`-c:v copy`, so no video
+ * re-encode) and no-ops for silent recordings.
+ */
+async function muxRecordedAudio(
+  destination: string,
+  preset: ExportAudioEnhance,
+  snapshot: ExportSnapshot,
+): Promise<void> {
+  const { project, duration, segments } = snapshot;
+
+  const kept =
+    segments.length > 0
+      ? segments.map((s) => ({ start: s.start, end: s.end }))
+      : [{ start: 0, end: duration }];
+
+  useEditorStore
+    .getState()
+    .setExportStatus(translateNow("export.status.addingAudio"));
+  await commands.muxExportAudio({
+    destination,
+    projectId: project.id,
+    audioSource: project.files.screen,
+    segments: kept,
+    preset,
+    hasSystemAudio: project.capture.capturedSystemAudio,
+  });
+}
+
+/**
+ * Trim (+ optional enhance) the recorded audio to a sidecar file in the project
+ * directory (so the WebView can read it over `media://`). Returns absolute path
+ * + media URL, or `null` when there is no audio.
+ */
+type PreparedExportAudio = { handle: string; mediaUrl: string };
+
+async function prepareExportAudioTrack(
+  fileExt: "m4a" | "webm",
+  preset: ExportAudioEnhance,
+  snapshot: ExportSnapshot,
+): Promise<PreparedExportAudio | null> {
+  const { project, duration, segments } = snapshot;
+
+  const kept =
+    segments.length > 0
+      ? segments.map((s) => ({ start: s.start, end: s.end }))
+      : [{ start: 0, end: duration }];
+
+  const prepared = await commands.prepareExportAudio({
+    projectId: project.id,
+    fileExt,
+    audioSource: project.files.screen,
+    segments: kept,
+    preset,
+    hasSystemAudio: project.capture.capturedSystemAudio,
+  });
+  if (!prepared) return null;
+  if (preset !== "off") {
+    console.info(
+      `[export] audio enhance=${preset} systemAudio=${project.capture.capturedSystemAudio}`,
+    );
+  }
+  return {
+    handle: prepared.handle,
+    mediaUrl: mediaUrl(project.id, prepared.fileName),
+  };
+}
+
+/** Keyframe spacing: fewer I-frames → less encoder work at the same bitrate. */
+const EXPORT_KEYFRAME_INTERVAL_SEC = 4;
+
+/** WebM codec preference — first the browser can encode at size wins. */
+const WEBM_CODECS: VideoCodec[] = ["vp9", "av1", "vp8"];
+
+type VideoEncodeTuning = {
+  codec: VideoCodec;
+  latencyMode: NonNullable<VideoEncodingAdditionalOptions["latencyMode"]>;
+  hardwareAcceleration: NonNullable<
+    VideoEncodingAdditionalOptions["hardwareAcceleration"]
+  >;
+};
+
+/**
+ * Pick the fastest supported encoder config without changing the caller's
+ * bitrate / resolution. Prefers hardware, then tries `realtime` before
+ * `quality`. Backpressure in the export loop keeps the encoder fed so
+ * `realtime` does not need to drop frames to keep up.
+ */
+async function pickWebmEncodeTuning(
+  width: number,
+  height: number,
+  bitrate: number,
+): Promise<VideoEncodeTuning | null> {
+  const hardwareModes: NonNullable<
+    VideoEncodingAdditionalOptions["hardwareAcceleration"]
+  >[] = ["prefer-hardware", "no-preference", "prefer-software"];
+  const latencyModes: NonNullable<
+    VideoEncodingAdditionalOptions["latencyMode"]
+  >[] = ["realtime", "quality"];
+
+  for (const hardwareAcceleration of hardwareModes) {
+    for (const latencyMode of latencyModes) {
+      for (const codec of WEBM_CODECS) {
+        if (
+          await canEncodeVideo(codec, {
+            width,
+            height,
+            bitrate,
+            latencyMode,
+            hardwareAcceleration,
+          })
+        ) {
+          return { codec, latencyMode, hardwareAcceleration };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Deterministic WebM export: decode each source frame, composite it, and encode
+ * it via WebCodecs (mediabunny). Unlike a realtime capture this does not depend
+ * on the machine keeping up with playback — it renders exactly `fps` frames per
+ * second of output regardless of how long each composite takes, so the result is
+ * always smooth with no dropped frames.
+ *
+ * Returns whether audio was muxed into the container (WebM can; the caller
+ * post-muxes when it could not).
+ */
+async function renderWebmToSink(
+  sink: ExportSink,
+  screenUrl: string,
+  faceCam: FaceCamTrack,
+  params: ResolvedExportParams,
+  audioMediaUrl: string | null,
+  signal: AbortSignal,
+  snapshot: ExportSnapshot,
+): Promise<boolean> {
+  const { width, height, fps, bitrate } = params;
+  throwIfAborted(signal);
+
+  const tuning =
+    typeof VideoEncoder !== "undefined"
+      ? await pickWebmEncodeTuning(width, height, bitrate)
+      : null;
+
+  if (!tuning) {
+    throw new Error(
+      "WebM export needs a VP9/AV1/VP8 encoder this system does not provide — export MP4 instead",
+    );
+  }
+
+  throwIfAborted(signal);
+  const projectId = snapshot.projectId;
+
+  const sequential = await openExportSequentialMedia(
+    screenUrl,
+    faceCam,
+    "webcodecs",
+    projectId,
+  );
+  let session;
+  if (sequential) {
+    session = await createExportCompositorFromMedia(
+      sequential.media,
+      width,
+      height,
+      { snapshot },
+    );
+  } else {
+    await ensureSeekableForSeekPath(projectId);
+    session = await createExportCompositor(screenUrl, faceCam, width, height, {
+      snapshot,
+    });
+  }
+  const {
+    canvas,
+    video,
+    camera,
+    segments,
+    drawAt,
+    dispose,
+    backend,
+    stats,
+    uploadStats,
+    isGpuLost,
+  } = session;
+  let disposeFrames: (() => void) | null = null;
+
+  const output = new Output({
+    format: new WebMOutputFormat(),
+    // Pipe each produced chunk straight to disk; 16 MiB batches keep IPC cheap.
+    target: new StreamTarget(sink.writable(), { chunked: true }),
+  });
+
+  let audioTrack: Awaited<ReturnType<typeof openExportAudioTrack>> = null;
+  let audioMuxed = false;
+  let audioError: unknown = null;
+
+  try {
+    const source = new CanvasSource(canvas, {
+      codec: tuning.codec,
+      bitrate,
+      bitrateMode: "variable",
+      latencyMode: tuning.latencyMode,
+      hardwareAcceleration: tuning.hardwareAcceleration,
+      keyFrameInterval: EXPORT_KEYFRAME_INTERVAL_SEC,
+    });
+    output.addVideoTrack(source, { frameRate: fps });
+
+    if (audioMediaUrl) {
+      audioTrack = await openExportAudioTrack(audioMediaUrl);
+      if (audioTrack) {
+        output.addAudioTrack(audioTrack.source);
+        audioMuxed = true;
+      }
+    }
+
+    await output.start();
+    // Observe the pump immediately so a failed audio track stops video work on
+    // the next frame instead of becoming an unhandled rejection at finalize.
+    const audioPump = audioTrack
+      ? audioTrack.pump().catch((error) => {
+          audioError = error;
+        })
+      : Promise.resolve();
+
+    const frameDuration = 1 / fps;
+    const frameTimes = planFrameTimes(segments, fps);
+    // Pixi uploads a decoded `VideoFrame` directly (canvas paint only for
+    // rotated samples — see `frameSurface`).
+    const reader =
+      sequential?.begin(frameTimes, { mode: "video-frame" }) ?? null;
+    const frames = createExportFrameIterator(
+      frameTimes,
+      reader,
+      reader
+        ? null
+        : { video, camera, faceCam },
+      { signal },
+    );
+    disposeFrames = frames.dispose;
+    const encodeQueue = new AdaptiveEncodeQueue(width, height, fps);
+    const progress = throttledProgress(frameTimes.length);
+    exportLog(
+      `[export] webm render loop: path=${frames.mode} ` +
+        `compositor=${backend} frames=${frameTimes.length} ` +
+        `codec=${tuning.codec} latency=${tuning.latencyMode} ` +
+        `hw=${tuning.hardwareAcceleration} ` +
+        `audio=${audioMuxed ? "in-container" : "post-mux"} ` +
+        `encodeDepthSeed=${encodeQueue.depth}`,
+    );
+    if (frames.mode === "seek") warnSeekPath("webm", frameTimes.length);
+
+    await frames.prime();
+
+    let framesDone = 0;
+    let timestamp = 0;
+    let yields = 0;
+    const loopStart = performance.now();
+    let lastYieldAt = loopStart;
+
+    for (let i = 0; i < frames.count; i += 1) {
+      throwIfAborted(signal);
+      if (audioError) throw audioError;
+      await frames.advance(i);
+      const t = frames.timeAt(i);
+      const composeStart = performance.now();
+      throwIfGpuLost(isGpuLost);
+      drawAt(t);
+      throwIfGpuLost(isGpuLost);
+      const frameComposeMs = performance.now() - composeStart;
+
+      const encoded = source.add(timestamp, frameDuration);
+      await withDeadline(
+        encodeQueue.push(encoded, frameComposeMs),
+        ENCODE_STALL_MS,
+        "webm encode backpressure",
+      );
+      timestamp += frameDuration;
+      framesDone += 1;
+      progress(framesDone);
+
+      const decision = shouldYieldNow(performance.now(), lastYieldAt);
+      if (decision.shouldYield) {
+        yields += 1;
+        await yieldToMain();
+        lastYieldAt = performance.now();
+        throwIfAborted(signal);
+      }
+    }
+    await withDeadline(encodeQueue.drain(), FLUSH_STALL_MS, "webm encode drain");
+    await withDeadline(audioPump, FLUSH_STALL_MS, "webm audio pump");
+    if (audioError) throw audioError;
+    const wallMs = performance.now() - loopStart;
+    const uploads = uploadStats();
+    exportLog(
+      `[export] webm render loop done in ${(wallMs / 1000).toFixed(1)}s ` +
+        `(${(framesDone / (wallMs / 1000)).toFixed(1)} fps) — ` +
+        `yields=${yields}` +
+        (uploads
+          ? `, uploads=${uploads.uploads} skipped=${uploads.skipped}`
+          : ""),
+    );
+    const breakdown = stats();
+    if (breakdown) exportLog(`[export] composite breakdown: ${breakdown}`);
+
+    await withDeadline(output.finalize(), FLUSH_STALL_MS, "webm finalize");
+    if (sink.bytesWritten < 256) {
+      throw new Error(
+        "export produced an empty video — try again or use a longer clip",
+      );
+    }
+    return audioMuxed;
+  } catch (e) {
+    // Release the encoder on failure; finalize() is what normally closes it.
+    if (output.state === "started")
+      await output.cancel().catch(() => undefined);
+    throw e;
+  } finally {
+    disposeFrames?.();
+    audioTrack?.dispose();
+    dispose();
+  }
+}
+
+async function notifyDone(destination: ExportDestination): Promise<void> {
+  try {
+    let granted = await isPermissionGranted();
+    if (!granted) granted = (await requestPermission()) === "granted";
+    if (granted)
+      sendNotification({
+        title: "Export finished",
+        body: destination.displayName,
+      });
+  } catch {
+    /* notifications are best-effort */
+  }
+  await commands.completeExport(destination.handle);
+}
