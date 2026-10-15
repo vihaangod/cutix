@@ -19,14 +19,13 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install pnpm
-        run: corepack enable
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: x86_64-pc-windows-msvc
+          with:
+            targets: x86_64-pc-windows-msvc
+
+      - name: Install pnpm
+        run: corepack enable
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -35,7 +34,7 @@ jobs:
         run: pnpm build
 
       - name: Build Tauri app
-        run: pnpm tauri build
+        run: pnpm tauri build --bundles nsis,msi --config "{\"bundle\":{\"createUpdaterArtifacts\":false}}"
 
       - name: Upload Windows installers
         uses: actions/upload-artifact@v4
