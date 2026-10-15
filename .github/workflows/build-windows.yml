@@ -9,6 +9,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,7 +34,7 @@ jobs:
         run: pnpm build
 
       - name: Build Tauri app
-        run: pnpm tauri build --bundles nsis,msi
+        run: pnpm tauri build
 
       - name: Upload Windows installers
         if: always()
