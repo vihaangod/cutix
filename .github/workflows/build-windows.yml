@@ -9,7 +9,6 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,8 +20,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-          with:
-            targets: x86_64-pc-windows-msvc
+        with:
+          targets: x86_64-pc-windows-msvc
 
       - name: Install pnpm
         run: corepack enable
@@ -34,13 +33,14 @@ jobs:
         run: pnpm build
 
       - name: Build Tauri app
-        run: pnpm tauri build --bundles nsis,msi --config "{\"bundle\":{\"createUpdaterArtifacts\":false}}"
+        run: pnpm tauri build --bundles nsis,msi
 
       - name: Upload Windows installers
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Captix-Windows-Installer
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/msi/*.msi
-          if-no-files-found: error
+          if-no-files-found: warn
